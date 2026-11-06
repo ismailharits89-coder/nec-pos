@@ -895,12 +895,93 @@
       { id: '5', sku: 'NEC-005', barcode: '8990001000005', name: 'Smart TV 32 Inch', category: 'Televisi', cost: 1600000, price: 2100000, stock: 3, warranty: 24, image: '' }
     ];
 
+
+    // ===== NEC CLOUD SYNC (Supabase) =====
+    const NEC_CLOUD_URL = 'https://heqgfxrovxnwvaqjufde.supabase.co';
+    const NEC_CLOUD_KEY = 'sb_publishable_0VTRWWJA8Gv2MqfefQmeug_bBdeyWwl';
+    const NEC_TS_PREFIX = 'nec_ts:';
+    const NEC_SYNCED_KEYS = ['nec_products','nec_transactions','nec_cash_balance','nec_pin_code','nec_pin_enabled','nec_store_info','nec_paper_width','nec_bt_print_enabled','nec_label_width_mm','nec_label_height_mm'];
+    const NEC_EXTRA_DEFAULTS = {
+      nec_products: (typeof DEFAULT_PRODUCTS !== 'undefined' ? DEFAULT_PRODUCTS : []),
+      nec_store_info: (typeof DEFAULT_STORE_INFO !== 'undefined' ? DEFAULT_STORE_INFO : {}),
+      nec_transactions: [], nec_cash_balance: 2500000, nec_pin_code: '1234', nec_pin_enabled: true,
+      nec_paper_width: 32, nec_bt_print_enabled: false, nec_label_width_mm: 40, nec_label_height_mm: 30
+    };
+    function necCloudHeaders(extra) {
+      const h = { 'apikey': NEC_CLOUD_KEY, 'Authorization': 'Bearer ' + NEC_CLOUD_KEY };
+      if (extra) { for (const k in extra) h[k] = extra[k]; }
+      return h;
+    }
+    function necIsSynced(key) { return NEC_SYNCED_KEYS.indexOf(key) !== -1; }
+    function necLocalTs(key) { try { return localStorage.getItem(NEC_TS_PREFIX + key) || ''; } catch (e) { return ''; } }
+    function necSetLocalTs(key, ts) { try { localStorage.setItem(NEC_TS_PREFIX + key, ts); } catch (e) {} }
+    function necPush(key, val, ts) {
+      if (!necIsSynced(key)) return;
+      try {
+        fetch(NEC_CLOUD_URL + '/rest/v1/pos_data?on_conflict=key', {
+          method: 'POST',
+          headers: necCloudHeaders({ 'Content-Type': 'application/json', 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
+          body: JSON.stringify({ key: key, value: val, updated_at: ts })
+        }).catch(function (e) { console.warn('nec push', key, e); });
+      } catch (e) { console.warn('nec push', key, e); }
+    }
+    async function necCloudPull() {
+      try {
+        const res = await fetch(NEC_CLOUD_URL + '/rest/v1/pos_data?select=key,value,updated_at', { headers: necCloudHeaders({ 'Content-Type': 'application/json' }) });
+        if (!res.ok) return;
+        const rows = await res.json();
+        if (!Array.isArray(rows)) return;
+        const byKey = {}; rows.forEach(function (r) { if (r && r.key) byKey[r.key] = r; });
+        let applied = false;
+        NEC_SYNCED_KEYS.forEach(function (k) {
+          const remote = byKey[k];
+          const raw = localStorage.getItem(k);
+          const lts = necLocalTs(k);
+          if (!remote) {
+            if (raw !== null) {
+              const ts = lts || new Date().toISOString();
+              if (!lts) necSetLocalTs(k, ts);
+              try { necPush(k, JSON.parse(raw), ts); } catch (e) {}
+            }
+            return;
+          }
+          const rts = remote.updated_at || '';
+          if (!lts) {
+            if (raw === null) {
+              try { localStorage.setItem(k, JSON.stringify(remote.value)); necSetLocalTs(k, rts || new Date().toISOString()); applied = true; } catch (e) {}
+            } else {
+              try { const ts = new Date().toISOString(); necPush(k, JSON.parse(raw), ts); necSetLocalTs(k, ts); } catch (e) {}
+            }
+            return;
+          }
+          const rTime = Date.parse(rts), lTime = Date.parse(lts);
+          if (rTime > lTime) {
+            try { localStorage.setItem(k, JSON.stringify(remote.value)); necSetLocalTs(k, rts); applied = true; } catch (e) {}
+          } else if (lTime > rTime && raw !== null) {
+            try { necPush(k, JSON.parse(raw), lts); } catch (e) {}
+          }
+        });
+        if (applied) { try { window.location.reload(); } catch (e) {} }
+      } catch (e) { console.warn('nec pull', e); }
+    }
+    let necPullTimer = null;
+    function necStartCloud() {
+      necCloudPull();
+      try { if (necPullTimer) clearInterval(necPullTimer); necPullTimer = setInterval(necCloudPull, 45000); } catch (e) {}
+      try { document.addEventListener('visibilitychange', function () { if (!document.hidden) necCloudPull(); }); } catch (e) {}
+    }
+    // ===== END NEC CLOUD SYNC =====
     function loadData(key, defaultVal) {
       try { const s = localStorage.getItem(key); return s ? JSON.parse(s) : defaultVal; }
       catch(e) { return defaultVal; }
     }
     function saveData(key, val) {
       try { localStorage.setItem(key, JSON.stringify(val)); } catch(e) { console.error(e); }
+      try {
+        const necTs = new Date().toISOString();
+        necSetLocalTs(key, necTs);
+        necPush(key, val, necTs);
+      } catch(e) { console.warn('nec save sync', e); }
     }
 
     let products = loadData('nec_products', DEFAULT_PRODUCTS);
@@ -2536,11 +2617,21 @@ Instruksi:
     function resetDatabase() {
       showConfirmModal('Reset semua data ke pengaturan awal?', () => {
         localStorage.clear();
+        try {
+          Object.keys(NEC_EXTRA_DEFAULTS).forEach(function(k) {
+            if (!necIsSynced(k)) return;
+            const ts = new Date().toISOString();
+            localStorage.setItem(k, JSON.stringify(NEC_EXTRA_DEFAULTS[k]));
+            necSetLocalTs(k, ts);
+            necPush(k, NEC_EXTRA_DEFAULTS[k], ts);
+          });
+        } catch (e) { console.warn('nec reset seed', e); }
         location.reload();
       }, { confirmLabel: 'Ya, Reset Data' });
     }
 
     window.addEventListener('DOMContentLoaded', () => {
+      necStartCloud();
       updatePrintPageSize();
       updateLockUI();
       lucide.createIcons();
